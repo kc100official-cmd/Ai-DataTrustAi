@@ -239,9 +239,14 @@ class AskResponse(BaseModel):
 
 class GraphIngestRequest(BaseModel):
     source_id: str = "enterprise_supply_ops"
+    document_id: Optional[str] = None
     title: str
     doc_type: str = "audit_memo"
     text: str
+
+
+class GraphBatchIngestRequest(BaseModel):
+    documents: List[GraphIngestRequest] = Field(min_length=1, max_length=2000)
 
 
 class GraphPathRequest(BaseModel):

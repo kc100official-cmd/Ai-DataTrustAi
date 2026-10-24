@@ -1,10 +1,11 @@
 import sqlite3
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 import numpy as np
 import requests
-from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 from .config import settings
+from .document_safety import expand_query_terms, sanitize_document_text, tokenize
+from .document_store import get_document_conflict_groups, search_document_scores
 from .sample_data import ensure_sample_databases, get_graph_db_path
 
 
@@ -13,11 +14,7 @@ def search_documents_and_excerpts(
     source_id: Optional[str] = None,
     top_k: int = 5,
 ) -> Dict[str, Any]:
-    """
-    Retrieve relevant documents and provenance excerpts.
-    Uses configured dense embeddings when enabled & reachable; otherwise transparently
-    uses TF-IDF lexical/n-gram cosine similarity fallback.
-    """
+    """Search the incrementally maintained document index and graph provenance."""
     ensure_sample_databases()
     conn = sqlite3.connect(str(get_graph_db_path()))
     conn.row_factory = sqlite3.Row
@@ -29,90 +26,80 @@ def search_documents_and_excerpts(
     else:
         doc_rows = cur.execute("SELECT * FROM documents").fetchall()
         rel_rows = cur.execute("SELECT * FROM relationships").fetchall()
-    conn.close()
+    if not doc_rows or not query.strip():
+        conn.close()
+        return {"query": query, "retrieval_method": "incremental_lexical_index", "embeddings_active": False, "results": []}
 
-    corpus: List[Dict[str, Any]] = []
-    for d in doc_rows:
-        corpus.append(
-            {
-                "id": d["id"],
-                "source_id": d["source_id"],
-                "title": d["title"],
-                "doc_type": d["doc_type"],
-                "excerpt": d["content"],
-                "record_type": "document",
-                "created_at": d["created_at"],
-            }
-        )
-
-    seen_excerpts = {c["excerpt"] for c in corpus}
-    for r in rel_rows:
-        ex = r["excerpt"]
-        if ex not in seen_excerpts:
-            seen_excerpts.add(ex)
-            corpus.append(
-                {
-                    "id": r["id"],
-                    "source_id": r["source_db"],
-                    "title": f"Provenance ({r['source_record']})",
-                    "doc_type": r["source_type"],
-                    "excerpt": ex,
-                    "record_type": "graph_provenance",
-                    "created_at": r["timestamp"],
-                }
-            )
-
-    if not corpus or not query.strip():
-        return {
-            "query": query,
-            "retrieval_method": "tfidf_lexical_fallback",
-            "embeddings_active": False,
-            "results": [],
+    safe_text_by_id = {row["id"]: sanitize_document_text(row["content"])[0] for row in doc_rows}
+    safe_title_by_id = {row["id"]: sanitize_document_text(row["title"])[0] for row in doc_rows}
+    corpus = [
+        {
+            "id": row["id"], "source_id": row["source_id"], "title": safe_title_by_id[row["id"]],
+            "doc_type": row["doc_type"], "excerpt": safe_text_by_id[row["id"]],
+            "record_type": "document", "created_at": row["created_at"],
         }
-
+        for row in doc_rows
+    ]
     texts = [f"{item['title']} {item['excerpt']}" for item in corpus]
+    ranked_scores: Dict[str, float] = {}
+    retrieval_method = "incremental_lexical_index"
+    embeddings_active = False
 
-    # Try dense embeddings if configured
     if settings.EMBEDDINGS_ENABLED and settings.EMBEDDING_ENDPOINT:
         dense_scores = _try_dense_embeddings(query, texts)
         if dense_scores is not None:
-            ranked = sorted(
-                zip(corpus, dense_scores), key=lambda x: x[1], reverse=True
-            )[:top_k]
-            return {
-                "query": query,
-                "retrieval_method": f"dense_embeddings ({settings.EMBEDDING_MODEL})",
-                "embeddings_active": True,
-                "results": [
-                    {**item, "score": round(float(sc), 4)}
-                    for item, sc in ranked
-                    if sc > 0.05
-                ],
-            }
+            ranked_scores = {item["id"]: float(score) for item, score in zip(corpus, dense_scores)}
+            retrieval_method = f"dense_embeddings ({settings.EMBEDDING_MODEL})"
+            embeddings_active = True
+    if not embeddings_active:
+        ranked_scores = search_document_scores(conn, query, source_id=source_id)
 
-    # Deterministic TF-IDF lexical & bi-gram fallback
-    vectorizer = TfidfVectorizer(stop_words="english", ngram_range=(1, 2))
-    tfidf_matrix = vectorizer.fit_transform(texts + [query])
-    query_vec = tfidf_matrix[-1]
-    doc_vecs = tfidf_matrix[:-1]
-    sims = cosine_similarity(query_vec, doc_vecs).flatten()
+    ranked_docs = sorted(
+        ((item, ranked_scores.get(item["id"], 0.0)) for item in corpus),
+        key=lambda pair: pair[1], reverse=True,
+    )
+    results = [
+        {**item, "score": round(float(score), 4), "retrieval_mode": retrieval_method, "conflicts": []}
+        for item, score in ranked_docs[:max(1, min(top_k, 50))]
+        if score > (0.05 if embeddings_active else 0.0)
+    ]
 
-    ranked_items = sorted(zip(corpus, sims), key=lambda x: x[1], reverse=True)[:top_k]
-    results = []
-    for item, score in ranked_items:
-        if score > 0.01:
-            results.append(
-                {
-                    **item,
-                    "score": round(float(score), 4),
-                    "retrieval_mode": "tfidf_lexical_fallback",
-                }
-            )
+    # Preserve graph-provenance search alongside document retrieval without rebuilding an index.
+    query_terms: Set[str] = expand_query_terms(query)
+    seen_excerpts = {item["excerpt"] for item in results}
+    if query_terms:
+        for row in rel_rows:
+            excerpt = sanitize_document_text(row["excerpt"])[0]
+            if not excerpt or excerpt in seen_excerpts:
+                continue
+            matched = query_terms.intersection(tokenize(excerpt))
+            score = len(matched) / max(1, len(query_terms))
+            if score > 0.08:
+                seen_excerpts.add(excerpt)
+                results.append({
+                    "id": row["id"], "source_id": row["source_db"],
+                    "title": f"Provenance ({row['source_record']})", "doc_type": row["source_type"],
+                    "excerpt": excerpt, "record_type": "graph_provenance", "created_at": row["timestamp"],
+                    "score": round(score, 4), "retrieval_mode": "graph_provenance_match", "conflicts": [],
+                })
+    results.sort(key=lambda item: item["score"], reverse=True)
+    results = results[:max(1, min(top_k, 50))]
 
+    document_ids = [item["id"] for item in results if item["record_type"] == "document"]
+    conflict_groups = get_document_conflict_groups(conn, document_ids=document_ids, source_id=source_id)
+    conflicts_by_doc: Dict[str, List[Dict[str, Any]]] = {}
+    for group in conflict_groups:
+        for claim in group["claims"]:
+            conflicts_by_doc.setdefault(claim["document_id"], []).append(group)
+    for item in results:
+        if item["record_type"] == "document":
+            item["conflicts"] = conflicts_by_doc.get(item["id"], [])
+    conn.close()
     return {
         "query": query,
-        "retrieval_method": "tfidf_lexical_fallback",
-        "embeddings_active": False,
+        "retrieval_method": retrieval_method,
+        "embeddings_active": embeddings_active,
+        "index_mode": "incremental_document_terms",
         "results": results,
     }
 

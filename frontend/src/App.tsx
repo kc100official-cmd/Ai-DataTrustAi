@@ -55,7 +55,7 @@ const EXAMPLE_QUESTIONS = [
     question: 'How is School A (Scindia STEM Academy Gwalior) connected to Region North and what are its SAT math scores?',
     bullets: [
       'Traces Scindia STEM Academy → Gwalior → Region North',
-      'Verifies SAT Math score (648) from SQLite records',
+      'Verifies SAT Math score (642) from SQLite records',
     ],
   },
   {
@@ -63,8 +63,26 @@ const EXAMPLE_QUESTIONS = [
     source_id: 'enterprise_supply_ops',
     question: 'Verify the contract status and compliance audit status for Adani Green Energy at Morena.',
     bullets: [
-      'Compares ERP Active status ($920K) vs. Audit Hold',
+      'Compares ERP Active status ($5.4M) vs. Audit Hold',
       'Flags conflicting evidence automatically',
+    ],
+  },
+  {
+    badge: 'Hindi Cross-Lingual (P2)',
+    source_id: 'enterprise_supply_ops',
+    question: 'अडानी ग्रीन एनर्जी की स्थिति क्या है?',
+    bullets: [
+      'Answers in Hindi over English documents with quotes',
+      'Replays verified multi-hop Knowledge Graph path',
+    ],
+  },
+  {
+    badge: 'Doc Contradiction (P2)',
+    source_id: 'enterprise_supply_ops',
+    question: 'What is Apex Labs status?',
+    bullets: [
+      'Detects conflicting audit memos across documents',
+      'Presents both active & suspended claims with sources',
     ],
   },
   {
@@ -752,8 +770,10 @@ export const App: React.FC = () => {
 
                   {/* Bullet-Point Formatted Verified Answer */}
                   <ul className="space-y-3 text-base sm:text-lg text-slate-100 bg-[#030d2b]/90 p-7 rounded-2xl border border-blue-400/20">
-                    {askResult.answer
-                      .split(/\n+|(?<=[.!?])\s+(?=[A-Z0-9•-])/)
+                    {(askResult.answer.includes('\n')
+                      ? askResult.answer.split(/\n+/)
+                      : askResult.answer.split(/(?<=[.!?])\s+(?=[A-Z•-])/)
+                    )
                       .map((line) => line.replace(/^[•\-*]\s*/, '').trim())
                       .filter(Boolean)
                       .map((point, idx) => (
@@ -958,6 +978,19 @@ export const App: React.FC = () => {
                           <p className="text-sm sm:text-base text-blue-100/90 leading-relaxed font-light">
                             “{doc.excerpt}”
                           </p>
+                          {doc.conflicts?.length > 0 && (
+                            <div className="rounded-xl border border-amber-400/35 bg-amber-950/30 p-3 space-y-2">
+                              <div className="text-xs font-semibold uppercase tracking-wide text-amber-200">
+                                Conflicting claims · review both sources
+                              </div>
+                              {doc.conflicts.flatMap((group: any) => group.claims).map((claim: any, claimIdx: number) => (
+                                <div key={`${claim.document_id}-${claim.value}-${claimIdx}`} className="text-xs text-amber-100/90">
+                                  <span className="font-semibold">{claim.subject}: {claim.value}</span>
+                                  <span className="block text-amber-100/60">{claim.document_id} · {claim.title}</span>
+                                </div>
+                              ))}
+                            </div>
+                          )}
                         </div>
                       ))}
                     </div>

@@ -38,6 +38,7 @@ class Settings:
     # Graph guardrails
     GRAPH_MAX_DEPTH: int = int(os.getenv("DATATRUST_GRAPH_MAX_DEPTH", "5"))
     GRAPH_MAX_NODES: int = int(os.getenv("DATATRUST_GRAPH_MAX_NODES", "150"))
+    GRAPH_MAX_EDGES: int = int(os.getenv("DATATRUST_GRAPH_MAX_EDGES", "35"))
 
     # BIRD benchmark path
     BIRD_DATASET_PATH: str = os.getenv("DATATRUST_BIRD_DATASET_PATH", "")

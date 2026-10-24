@@ -1,7 +1,16 @@
+import sqlite3
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 from .community_engine import get_community_by_id
-from .graph_engine import find_bounded_paths, get_full_graph
+from .document_safety import (
+    expand_query_terms,
+    is_hindi_question,
+    normalize_multilingual_query,
+    sanitize_document_text,
+    tokenize,
+)
+from .graph_engine import find_bounded_paths, get_graph_nodes
+from .document_store import get_document_conflict_groups
 from .models import (
     AskRequest,
     AskResponse,
@@ -14,7 +23,43 @@ from .models import (
 )
 from .retrieval_engine import search_documents_and_excerpts
 from .router_engine import inspect_and_route_question
+from .sample_data import get_graph_db_path
 from .sql_engine import execute_sql_with_repair, generate_sql_from_question
+
+# Words that appear in many company names and therefore cannot tie a conflict to a question on their own.
+_GENERIC_SUBJECT_TOKENS = {
+    "limited", "ltd", "india", "indian", "industries", "systems", "services", "energy", "green", "labs",
+    "pharma", "power", "group", "company", "corp", "the", "and", "brothers", "region", "plant", "hub",
+}
+
+
+def _conflict_is_relevant(group: Dict[str, Any], question_terms: Set[str]) -> bool:
+    """A contradiction is only surfaced when its subject is actually mentioned in the question."""
+    subject_tokens = [
+        t for t in tokenize(group.get("subject", ""))
+        if len(t) >= 3 and t not in _GENERIC_SUBJECT_TOKENS
+    ]
+    if not subject_tokens:
+        return False
+    return any(t in question_terms for t in subject_tokens)
+
+
+def _documents_assert_suspension(subject: str) -> bool:
+    """Check the live document store (not just the top-k hits) for a sanitized suspension statement."""
+    try:
+        conn = sqlite3.connect(str(get_graph_db_path()))
+        rows = conn.execute(
+            "SELECT content FROM documents WHERE lower(content) LIKE ? AND lower(content) LIKE '%suspend%'",
+            (f"%{subject.casefold()}%",),
+        ).fetchall()
+        conn.close()
+    except sqlite3.Error:
+        return False
+    for (content,) in rows:
+        safe = sanitize_document_text(content)[0].casefold()
+        if subject.casefold() in safe and "suspend" in safe:
+            return True
+    return False
 
 
 def answer_and_validate_question(req: AskRequest) -> AskResponse:
@@ -27,7 +72,7 @@ def answer_and_validate_question(req: AskRequest) -> AskResponse:
     """
     t0 = time.perf_counter()
     q_clean = req.question.strip()
-    q_low = q_clean.lower()
+    q_low = f"{q_clean.casefold()} {normalize_multilingual_query(q_clean)}".lower()
     source_id = req.source_id
 
     routing = inspect_and_route_question(
@@ -86,8 +131,8 @@ def answer_and_validate_question(req: AskRequest) -> AskResponse:
         )
 
     # Gather Graph & Community context
-    graph_snapshot = get_full_graph(source_id=source_id, include_inferred=True, include_merged_aliases=True)
-    all_nodes_dict = {n["id"]: n for n in graph_snapshot["nodes"]}
+    graph_nodes = get_graph_nodes(source_id=source_id, include_merged_aliases=True)
+    all_nodes_dict = {n["id"]: n for n in graph_nodes}
 
     community_context = None
     if req.community_id:
@@ -110,16 +155,17 @@ def answer_and_validate_question(req: AskRequest) -> AskResponse:
             allow_repair=True,
         )
 
-    # Step B: Execute Graph Path Discovery if Graph or Hybrid strategy
-    if routing.selected_strategy in ("graph_retrieval", "hybrid_retrieval"):
-        evidence_paths, involved_entities = _discover_relevant_evidence_paths(
-            q_low, source_id, all_nodes_dict, community_context
-        )
-
-    # Step C: Execute Semantic/Document search if Semantic or Hybrid strategy (or to corroborate Graph)
+    # Step B: Retrieve documents before path discovery so citations can link to their graph nodes.
     if routing.selected_strategy in ("semantic_retrieval", "hybrid_retrieval", "graph_retrieval"):
         sem_res = search_documents_and_excerpts(q_clean, source_id=source_id, top_k=4)
         semantic_evidence = sem_res["results"]
+
+    # Step C: Discover paths for graph strategies and for every Hindi question (graph path is always shown).
+    if routing.selected_strategy in ("graph_retrieval", "hybrid_retrieval") or is_hindi_question(q_clean):
+        evidence_paths, involved_entities = _discover_relevant_evidence_paths(
+            q_low, source_id, all_nodes_dict, community_context,
+            document_ids=[item["id"] for item in semantic_evidence if item.get("record_type") == "document"],
+        )
 
     # Step D: Synthesize verified answer & evaluate claim-level verification status
     answer_text, overall_status, status_rationale, claims, conflict_notes = _synthesize_and_verify(
@@ -158,6 +204,7 @@ def _discover_relevant_evidence_paths(
     source_id: str,
     all_nodes_dict: Dict[str, Dict[str, Any]],
     community_context: Optional[Dict[str, Any]] = None,
+    document_ids: Optional[List[str]] = None,
 ) -> Tuple[List[EvidencePath], List[GraphNode]]:
     """Find exact supporting graph paths for entities mentioned in the question."""
     matched_ids: List[str] = []
@@ -227,6 +274,17 @@ def _discover_relevant_evidence_paths(
                     paths.extend(cand_paths)
                     break
 
+    # Link a mentioned entity to the exact source documents returned by retrieval.
+    for document_id in document_ids or []:
+        document_node_id = f"ENT-{document_id}"
+        if document_node_id not in all_nodes_dict:
+            continue
+        for entity_id in matched_ids:
+            if entity_id == document_node_id:
+                continue
+            doc_paths = find_bounded_paths(entity_id, document_node_id, max_depth=2, include_inferred=False)
+            paths.extend(doc_paths)
+
     # If still no specific pair matched, provide representative verified path for the source or community
     if not paths:
         if community_context and len(community_context.get("entities", [])) >= 2:
@@ -279,17 +337,83 @@ def _synthesize_and_verify(
 ) -> Tuple[str, VerificationStatus, str, List[ClaimValidation], List[str]]:
     claims: List[ClaimValidation] = []
     conflict_notes: List[str] = []
+    hindi = is_hindi_question(question)
 
-    # Check for the signature conflicting-evidence scenario: Adani Green Energy (CNT-904 ACTIVE vs DOC-2026-04 SUSPENDED at Morena Solar & Grid Sub-Station)
-    is_adani_conflict = (
-        "adani" in q_low
-        or "helios" in q_low
-        or (
-            sql_result
-            and any("Adani Green Energy" in str(r.values()) for r in sql_result.rows)
-            and ("suspend" in q_low or "status" in q_low or "conflict" in q_low or "audit" in q_low or "morena" in q_low or strategy == "hybrid_retrieval")
-        )
-    )
+    # Return every source-backed side of an indexed document contradiction that is relevant to this question.
+    question_terms = expand_query_terms(question) | set(tokenize(q_low))
+    conflict_groups: Dict[str, Dict[str, Any]] = {}
+    for item in semantic_evidence:
+        for group in item.get("conflicts", []):
+            if _conflict_is_relevant(group, question_terms):
+                conflict_groups[group["claim_key"]] = group
+    # Also consult the full claim store so a contradiction is never hidden by top-k retrieval cut-offs.
+    try:
+        store_conn = sqlite3.connect(str(get_graph_db_path()))
+        store_conn.row_factory = sqlite3.Row
+        for group in get_document_conflict_groups(store_conn, source_id=source_id):
+            if _conflict_is_relevant(group, question_terms):
+                conflict_groups.setdefault(group["claim_key"], group)
+        store_conn.close()
+    except sqlite3.Error:
+        pass
+    if conflict_groups:
+        all_conflicting_claims = []
+        for group in conflict_groups.values():
+            all_conflicting_claims.extend(group["claims"])
+        seen_claims = set()
+        unique_claims = []
+        for claim in all_conflicting_claims:
+            identity = (claim["document_id"], claim["value"], claim["excerpt"])
+            if identity not in seen_claims:
+                seen_claims.add(identity)
+                unique_claims.append(claim)
+        for idx, claim in enumerate(unique_claims, 1):
+            claim_text = (
+                f"{claim['subject']} का {claim['predicate']} {claim['value']} है।"
+                if hindi else f"{claim['subject']} has {claim['predicate']} = {claim['value']}."
+            )
+            claims.append(ClaimValidation(
+                claim_id=f"CLM-DOC-CONFLICT-{idx}",
+                claim_text=claim_text,
+                status="Conflicting evidence",
+                is_direct_fact=True,
+                supporting_sources=[f"{claim['document_id']} ({claim['title']})"],
+                evidence_excerpt=claim["excerpt"],
+                conflict_note="This source disagrees with another ingested document; neither is selected as authoritative.",
+            ))
+        lines = []
+        for claim in unique_claims:
+            if hindi:
+                lines.append(
+                    f"- **{claim['subject']} — {claim['predicate']}: `{claim['value']}`** — स्रोत: "
+                    f"`{claim['document_id']}` ({claim['title']}). उद्धरण: “{claim['excerpt']}”"
+                )
+            else:
+                lines.append(
+                    f"- **{claim['subject']} — {claim['predicate']}: `{claim['value']}`** — Source: "
+                    f"`{claim['document_id']}` ({claim['title']}). Excerpt: “{claim['excerpt']}”"
+                )
+        path_line = ""
+        if evidence_paths:
+            path_label = "सहायक ग्राफ पथ" if hindi else "Supporting graph path"
+            path_line = f"\n\n**{path_label}:** `{evidence_paths[0].summary_chain}`"
+        if hindi:
+            answer = "**दस्तावेज़ों में विरोधाभासी दावे मिले; किसी एक स्रोत को सही नहीं चुना गया।**\n\n" + "\n".join(lines) + path_line
+            rationale = "अलग-अलग दस्तावेज़ों के दावों को उनके स्रोत और मूल उद्धरण सहित दिखाया गया है।"
+            conflict_notes.append("दस्तावेज़ों में विरोधाभासी स्थिति दावे मिले; सत्यता तय करने के लिए स्रोत समीक्षा आवश्यक है।")
+        else:
+            answer = "**Conflicting document claims found. Neither source was selected as authoritative.**\n\n" + "\n".join(lines) + path_line
+            rationale = "Contradicting document claims are shown with their source IDs and exact excerpts."
+            conflict_notes.append("Conflicting document claims require source review; no document was silently preferred.")
+        return answer, "Conflicting evidence", rationale, claims, conflict_notes
+
+    # Preserve the Phase 1 SQL/document conflict, but derive the document side from live content.
+    active_sql_record = bool(sql_result and any(
+        "adani green energy" in str(row).casefold() and "active" in str(row).casefold()
+        for row in sql_result.rows
+    ))
+    suspended_doc = _documents_assert_suspension("adani green energy")
+    is_adani_conflict = active_sql_record and suspended_doc
 
     if is_adani_conflict:
         claims.append(
@@ -322,10 +446,17 @@ def _synthesize_and_verify(
             "2. **Compliance Audit Directive (`DOC-2026-04` & `quality_incidents:INC-701`):** Explicitly states that **Adani Green Energy** was **SUSPENDED on 2026-08-20** after triggering critical incident `INC-701` (*Transformer Thermal Failure* at **Morena**, **\\$1,420,000** financial impact), noting that the legacy SQL table has not yet synced.\n"
             "3. **Graph Provenance Path:** `Adani Green Energy → SUPPLIES_TO → Morena Solar & Grid Sub-Station → LOCATED_IN → Region North (Gwalior-Morena-Jaipur-Ajmer)`."
         )
+        if hindi:
+            answer = (
+                "**SQL और अनुपालन दस्तावेज़ों में विरोधाभास मिला; किसी एक स्रोत को सही नहीं चुना गया।**\n\n"
+                "1. **संरचित डेटाबेस (`procurement_contracts:CNT-904`):** Adani Green Energy की स्थिति `ACTIVE` और अनुबंध राशि **$5,400,000** दर्ज है।\n"
+                "2. **अनुपालन निर्देश (`DOC-2026-04`):** इसमें Adani Green Energy को `SUSPENDED` बताया गया है; दस्तावेज़ ERP sync freeze का उल्लेख करता है।\n"
+                "3. **सहायक ग्राफ पथ:** `Adani Green Energy → SUPPLIES_TO → Morena Solar & Grid Sub-Station → LOCATED_IN → Region North`."
+            )
         return (
             answer,
             "Conflicting evidence",
-            "Structured ERP table (CNT-904: ACTIVE) directly contradicts Compliance Directive DOC-2026-04 (SUSPENDED after INC-701 at Morena).",
+            "Structured ERP status and current compliance document status conflict; both source records are shown.",
             claims,
             conflict_notes,
         )
@@ -464,11 +595,29 @@ def _synthesize_and_verify(
             f"({'INFERRED RULE' if h.is_inferred else 'CONFIRMED FACT'} — Source: `{h.source_record}`, Confidence: `{int(h.confidence * 100)}%`)"
             for h in p0.hops
         )
-        answer = (
-            f"**Knowledge Graph Evidence Path Replay (`{p0.summary_chain}`):**\n\n"
-            f"{hop_bullets}\n\n"
-            f"**Provenance Summary:** {p0.supporting_explanation}"
-        )
+        if hindi:
+            doc_note = ""
+            if semantic_evidence:
+                doc_note = "\n\n**स्रोत दस्तावेज़:**\n" + "\n".join(
+                    f"- `{item['id']}` ({item['title']}): “{item['excerpt'][:500]}”"
+                    for item in semantic_evidence[:2] if item.get("record_type") == "document"
+                )
+            answer = (
+                f"**ज्ञान ग्राफ का समर्थित पथ (`{p0.summary_chain}`):**\n\n{hop_bullets}\n\n"
+                f"**स्रोत सारांश:** इस पथ के हर चरण का स्रोत रिकॉर्ड उपलब्ध है।{doc_note}"
+            )
+        else:
+            doc_note = ""
+            if semantic_evidence:
+                doc_note = "\n\n**Retrieved source documents:**\n" + "\n".join(
+                    f"- `{item['id']}` ({item['title']}): “{item['excerpt'][:500]}”"
+                    for item in semantic_evidence[:2] if item.get("record_type") == "document"
+                )
+            answer = (
+                f"**Knowledge Graph Evidence Path Replay (`{p0.summary_chain}`):**\n\n"
+                f"{hop_bullets}\n\n"
+                f"**Provenance Summary:** {p0.supporting_explanation}{doc_note}"
+            )
         status = "Supported" if all_direct else "Partially supported"
         rationale = (
             "Every hop in the primary graph path is backed by confirmed source records."
@@ -493,11 +642,19 @@ def _synthesize_and_verify(
                 evidence_excerpt=top_doc["excerpt"],
             )
         )
-        answer = (
-            f"**Document Evidence Retrieved (`{top_doc['id']} — {top_doc['title']}`):**\n\n"
-            f"> \"{top_doc['excerpt']}\"\n\n"
-            f"Retrieved via `{top_doc.get('retrieval_mode', 'tfidf_lexical_fallback')}` (Similarity score: `{top_doc['score']}`)."
-        )
+        if hindi:
+            path_note = f"\n\n**सहायक ग्राफ पथ:** `{evidence_paths[0].summary_chain}`" if evidence_paths else ""
+            answer = (
+                f"**अंग्रेज़ी दस्तावेज़ से मिला साक्ष्य (`{top_doc['id']} — {top_doc['title']}`):**\n\n"
+                f"इस दस्तावेज़ का संबंधित मूल उद्धरण:\n> \"{top_doc['excerpt']}\"{path_note}"
+            )
+        else:
+            path_note = f"\n\n**Supporting graph path:** `{evidence_paths[0].summary_chain}`" if evidence_paths else ""
+            answer = (
+                f"**Document Evidence Retrieved (`{top_doc['id']} — {top_doc['title']}`):**\n\n"
+                f"> \"{top_doc['excerpt']}\"\n\n"
+                f"Retrieved via `{top_doc.get('retrieval_mode', 'incremental_lexical_index')}` (Similarity score: `{top_doc['score']}`).{path_note}"
+            )
         return (
             answer,
             "Supported",

@@ -3,10 +3,13 @@ import hashlib
 import json
 import re
 import sqlite3
+import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 import networkx as nx
 from .config import settings
+from .document_safety import sanitize_document_text
+from .document_store import get_document_conflict_groups, index_document
 from .models import (
     EvidenceHop,
     EvidencePath,
@@ -83,8 +86,9 @@ def get_full_graph(
     include_inferred: bool = True,
     include_merged_aliases: bool = False,
     search_query: Optional[str] = None,
+    max_edges: Optional[int] = None,
 ) -> Dict[str, Any]:
-    """Retrieve bounded knowledge graph nodes and edges with full provenance."""
+    """Retrieve bounded knowledge graph nodes and edges with clean graph link prioritization."""
     conn = _get_graph_conn()
     cur = conn.cursor()
 
@@ -96,11 +100,33 @@ def get_full_graph(
     if not include_merged_aliases:
         where_clauses.append("is_merged = 0")
 
-    where_sql = ("WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
-    ent_rows = cur.execute(
-        f"SELECT * FROM entities {where_sql} LIMIT ?",
-        (*params, settings.GRAPH_MAX_NODES),
-    ).fetchall()
+    where_sql = (" WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
+    # Display cap: core (non-document) entities first, then the most recently ingested/edited documents,
+    # so a document added or edited a moment ago is visible immediately even with 500+ documents loaded.
+    order_sql = " ORDER BY CASE WHEN entity_type = 'Document' THEN 1 ELSE 0 END, CASE WHEN entity_type = 'Document' THEN timestamp END DESC, rowid"
+    if search_query:
+        like = f"%{search_query.casefold().strip()}%"
+        alias_hits = cur.execute(
+            "SELECT canonical_id FROM entities WHERE is_merged = 1 AND canonical_id IS NOT NULL AND lower(name) LIKE ?",
+            (like,),
+        ).fetchall()
+        alias_ids = [r["canonical_id"] for r in alias_hits]
+        search_clause = "(lower(name) LIKE ? OR lower(id) LIKE ? OR lower(entity_type) LIKE ?"
+        search_params: List[Any] = [like, like, like]
+        if alias_ids:
+            search_clause += f" OR id IN ({','.join('?' for _ in alias_ids)})"
+            search_params.extend(alias_ids)
+        search_clause += ")"
+        joined = where_sql + (" AND " if where_sql else " WHERE ") + search_clause
+        ent_rows = cur.execute(
+            f"SELECT * FROM entities{joined}{order_sql} LIMIT ?",
+            (*params, *search_params, settings.GRAPH_MAX_NODES),
+        ).fetchall()
+    else:
+        ent_rows = cur.execute(
+            f"SELECT * FROM entities{where_sql}{order_sql} LIMIT ?",
+            (*params, settings.GRAPH_MAX_NODES),
+        ).fetchall()
 
     # Build alias map for merged entities
     merged_rows = cur.execute("SELECT id, name, canonical_id FROM entities WHERE is_merged = 1").fetchall()
@@ -116,18 +142,7 @@ def get_full_graph(
     entity_names = {r["id"]: r["name"] for r in all_ent_rows}
 
     nodes: List[GraphNode] = [_row_to_node(r, aliases_map) for r in ent_rows]
-    if search_query:
-        q_low = search_query.lower().strip()
-        matched_ids = {
-            n.id
-            for n in nodes
-            if q_low in n.name.lower()
-            or q_low in n.entity_type.lower()
-            or q_low in n.id.lower()
-            or any(q_low in a.lower() for a in n.aliases)
-        }
-    else:
-        matched_ids = {n.id for n in nodes}
+    matched_ids = {n.id for n in nodes}
 
     edge_clauses = []
     edge_params: List[Any] = []
@@ -141,12 +156,21 @@ def get_full_graph(
         edge_clauses.append("is_inferred = 0")
 
     edge_where = ("WHERE " + " AND ".join(edge_clauses)) if edge_clauses else ""
-    rel_rows = cur.execute(f"SELECT * FROM relationships {edge_where}", edge_params).fetchall()
-    conn.close()
+    # Clean Graph link prioritization: prioritize structural business/domain relationships
+    # over noisy unstructured document references to preserve an elegant, uncluttered graph look.
+    edge_order = """ ORDER BY
+        CASE
+            WHEN rel_type IN ('LOCATED_IN', 'SUPPLIES_TO', 'MANAGES', 'PART_OF', 'OWNS', 'WORKS_FOR', 'CAUSED_BY') THEN 0
+            WHEN is_inferred = 1 THEN 1
+            ELSE 2
+        END,
+        confidence DESC,
+        timestamp DESC"""
+    rel_rows = cur.execute(f"SELECT * FROM relationships {edge_where}{edge_order}", edge_params).fetchall()
 
     edges: List[GraphEdge] = []
-    included_node_ids = set(matched_ids)
     node_lookup = {n.id: n for n in nodes}
+    neighbor_ids: set = set()
 
     for r in rel_rows:
         e = _row_to_edge(r, entity_names)
@@ -158,16 +182,37 @@ def get_full_graph(
             if e.target in canonical_redirect:
                 e.target = canonical_redirect[e.target]
                 e.target_name = entity_names.get(e.target, e.target)
+        if e.source == e.target:
+            continue
         if search_query:
             if e.source in matched_ids or e.target in matched_ids:
                 edges.append(e)
-                included_node_ids.add(e.source)
-                included_node_ids.add(e.target)
+                neighbor_ids.update({e.source, e.target} - set(node_lookup))
         else:
             if e.source in node_lookup and e.target in node_lookup:
                 edges.append(e)
 
-    final_nodes = [n for n in nodes if n.id in included_node_ids]
+    # Search mode: load the 1-hop neighbours of matches so no edge points at a missing node.
+    if neighbor_ids:
+        room = max(0, settings.GRAPH_MAX_NODES - len(nodes))
+        wanted = sorted(neighbor_ids)[:room]
+        if wanted:
+            extra_rows = cur.execute(
+                f"SELECT * FROM entities WHERE id IN ({','.join('?' for _ in wanted)})", wanted
+            ).fetchall()
+            for row in extra_rows:
+                node = _row_to_node(row, aliases_map)
+                nodes.append(node)
+                node_lookup[node.id] = node
+        edges = [e for e in edges if e.source in node_lookup and e.target in node_lookup]
+    conn.close()
+
+    # Apply Clean Graph link limit to decrease clutter unless caller explicitly requests unbounded (0)
+    effective_max_edges = max_edges if max_edges is not None else settings.GRAPH_MAX_EDGES
+    if effective_max_edges and effective_max_edges > 0 and len(edges) > effective_max_edges:
+        edges = edges[:effective_max_edges]
+
+    final_nodes = nodes
     rel_types = sorted({e.rel_type for e in edges})
 
     return {
@@ -178,6 +223,24 @@ def get_full_graph(
         "inferred_edge_count": sum(1 for e in edges if e.is_inferred),
         "total_nodes": len(final_nodes),
     }
+
+
+def get_graph_nodes(source_id: Optional[str] = None, include_merged_aliases: bool = True) -> List[Dict[str, Any]]:
+    """Return graph nodes without the visualization's display cap for answer retrieval."""
+    conn = _get_graph_conn()
+    cur = conn.cursor()
+    where = " WHERE source_db = ?" if source_id else ""
+    params: Tuple[Any, ...] = (source_id,) if source_id else ()
+    if not include_merged_aliases:
+        where += (" AND " if where else " WHERE ") + "is_merged = 0"
+    rows = cur.execute(f"SELECT * FROM entities{where}", params).fetchall()
+    merged_rows = cur.execute("SELECT id, name, canonical_id FROM entities WHERE is_merged = 1").fetchall()
+    aliases: Dict[str, List[str]] = {}
+    for row in merged_rows:
+        if row["canonical_id"]:
+            aliases.setdefault(row["canonical_id"], []).append(f"{row['name']} ({row['id']})")
+    conn.close()
+    return [_row_to_node(row, aliases).model_dump() for row in rows]
 
 
 def get_entity_details(entity_id: str) -> Optional[Dict[str, Any]]:
@@ -445,24 +508,47 @@ def ingest_document_to_graph(
     title: str,
     doc_type: str,
     text: str,
+    document_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Extract entities and typed relationships from raw text with full provenance,
     persist them into SQLite graph store, and generate merge suggestions if duplicates exist.
     """
+    started = time.perf_counter()
     conn = _get_graph_conn()
     cur = conn.cursor()
     ts = datetime.now(timezone.utc).isoformat()
-    doc_hash = hashlib.sha1(f"{title}:{text}".encode("utf-8")).hexdigest()[:8].upper()
-    doc_id = f"DOC-ING-{doc_hash}"
+    existing_doc = None
+    if document_id:
+        existing_doc = cur.execute("SELECT id FROM documents WHERE id = ?", (document_id,)).fetchone()
+        if not existing_doc:
+            conn.close()
+            raise ValueError(f"Document '{document_id}' was not found for update.")
+        doc_id = document_id
+    else:
+        existing_doc = cur.execute(
+            "SELECT id FROM documents WHERE source_id = ? AND lower(title) = lower(?) ORDER BY id LIMIT 1",
+            (source_id, title),
+        ).fetchone()
+        doc_id = existing_doc["id"] if existing_doc else f"DOC-ING-{hashlib.sha1(f'{source_id}:{title.casefold()}'.encode('utf-8')).hexdigest()[:12].upper()}"
+    operation = "updated" if existing_doc else "created"
 
+    # A document owns its provenance edges and any now-orphaned document-only nodes.
+    _remove_document_graph_contributions(cur, doc_id)
     cur.execute(
-        "INSERT OR REPLACE INTO documents VALUES (?, ?, ?, ?, ?, ?)",
+        """INSERT INTO documents (id, source_id, title, doc_type, content, created_at)
+           VALUES (?, ?, ?, ?, ?, ?)
+           ON CONFLICT(id) DO UPDATE SET source_id=excluded.source_id, title=excluded.title,
+               doc_type=excluded.doc_type, content=excluded.content, created_at=excluded.created_at""",
         (doc_id, source_id, title, doc_type, text, ts),
     )
 
+    safe_text, ignored_instruction_count = sanitize_document_text(text)
+    safe_title, ignored_title_count = sanitize_document_text(title)
+    ignored_instruction_count += ignored_title_count
+
     existing_rows = cur.execute("SELECT id, name, entity_type FROM entities WHERE source_db = ?", (source_id,)).fetchall()
-    existing_by_name = {r["name"].lower(): (r["id"], r["name"], r["entity_type"]) for r in existing_rows}
+    existing_by_name = {r["name"].casefold(): (r["id"], r["name"], r["entity_type"]) for r in existing_rows}
 
     extracted_entities: List[Dict[str, Any]] = []
     extracted_edges: List[Dict[str, Any]] = []
@@ -470,7 +556,7 @@ def ingest_document_to_graph(
     # 1. Match known entities mentioned in text
     mentioned_entities: List[Tuple[str, str, str]] = []
     for low_name, (eid, ename, etype) in existing_by_name.items():
-        if low_name in text.lower():
+        if len(low_name) > 2 and low_name in safe_text.casefold():
             mentioned_entities.append((eid, ename, etype))
 
     # 2. Pattern NER for new capitalized entities with type indicators (including Indian corporate & city patterns)
@@ -483,13 +569,13 @@ def ingest_document_to_graph(
     ]
 
     for pat, etype in patterns:
-        for match in re.finditer(pat, text):
+        for match in re.finditer(pat, safe_text):
             candidate_name = match.group(1).strip()
-            low_cand = candidate_name.lower()
+            low_cand = candidate_name.casefold()
             if low_cand in existing_by_name:
                 continue
             new_id = f"ENT-{hashlib.md5(f'{source_id}:{candidate_name}'.encode()).hexdigest()[:7].upper()}"
-            excerpt = text[max(0, match.start() - 40) : min(len(text), match.end() + 60)].strip()
+            excerpt = safe_text[max(0, match.start() - 40) : min(len(safe_text), match.end() + 60)].strip()
             cur.execute(
                 "INSERT OR IGNORE INTO entities VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)",
                 (
@@ -513,7 +599,7 @@ def ingest_document_to_graph(
             extracted_entities.append({"id": new_id, "name": candidate_name, "entity_type": etype})
 
     # 3. Extract sentence-level typed relationships between mentioned entities
-    sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", text) if s.strip()]
+    sentences = [s.strip() for s in re.split(r"(?<=[.!?।！？])\s+", safe_text) if s.strip()]
     rel_Rules = [
         (r"\b(?:located in|operates in|in\s+Region)\b", "LOCATED_IN"),
         (r"\b(?:supplies|supplies to|supplier to|under contract)\b", "SUPPLIES_TO"),
@@ -574,64 +660,182 @@ def ingest_document_to_graph(
                     }
                 )
 
-    # 4. If entities were mentioned/extracted but no pairwise sentence edges formed, create a Document node and link them via REFERENCES
-    if mentioned_entities and not extracted_edges:
-        doc_ent_id = f"ENT-{doc_id}"
+    # Give every ingested document a stable graph node and source-backed reference edges.
+    doc_ent_id = f"ENT-{doc_id}"
+    doc_node_name = f"{safe_title} ({doc_id})"
+    doc_excerpt = safe_text[:240].strip()
+    cur.execute(
+        """INSERT OR REPLACE INTO entities
+           (id, source_db, name, entity_type, canonical_id, attributes_json, source_id, source_type,
+            source_record, excerpt, extraction_method, confidence, timestamp, is_merged)
+           VALUES (?, ?, ?, 'Document', NULL, ?, ?, 'document', ?, ?, 'document_ingest', 1.0, ?, 0)""",
+        (doc_ent_id, source_id, doc_node_name, json.dumps({"doc_id": doc_id, "doc_type": doc_type}),
+         doc_id, f"{doc_id}:{title}", doc_excerpt, ts),
+    )
+    if not any(item["id"] == doc_ent_id for item in extracted_entities):
+        extracted_entities.append({"id": doc_ent_id, "name": doc_node_name, "entity_type": "Document"})
+    seen_eids = set()
+    for eid, ename, _ in mentioned_entities:
+        if eid in seen_eids or eid == doc_ent_id:
+            continue
+        seen_eids.add(eid)
+        rel_id = f"REL-{hashlib.md5(f'{doc_id}:{doc_ent_id}:REFERENCES:{eid}'.encode()).hexdigest()[:8].upper()}"
         cur.execute(
-            "INSERT OR IGNORE INTO entities VALUES (?, ?, ?, 'Document', NULL, ?, ?, 'document', ?, ?, 'pattern_ner', 1.0, ?, 0)",
-            (
-                doc_ent_id,
-                source_id,
-                f"{title} ({doc_id})",
-                json.dumps({"doc_id": doc_id, "doc_type": doc_type}),
-                doc_id,
-                f"{doc_id}:{title}",
-                text[:160].strip(),
-                ts,
-            ),
+            """INSERT OR REPLACE INTO relationships
+               (id, source_db, source_entity_id, target_entity_id, rel_type, source_id, source_type,
+                source_record, excerpt, extraction_method, confidence, timestamp, is_inferred, inference_rule)
+               VALUES (?, ?, ?, ?, 'REFERENCES', ?, 'document', ?, ?, 'document_reference', 0.92, ?, 0, NULL)""",
+            (rel_id, source_id, doc_ent_id, eid, doc_id, f"{doc_id}:{title}", doc_excerpt, ts),
         )
-        extracted_entities.append({"id": doc_ent_id, "name": f"{title} ({doc_id})", "entity_type": "Document"})
-        seen_eids = set()
-        for eid, ename, _ in mentioned_entities:
-            if eid in seen_eids or eid == doc_ent_id:
-                continue
-            seen_eids.add(eid)
-            rel_id = f"REL-{hashlib.md5(f'{doc_id}:{doc_ent_id}:REFERENCES:{eid}'.encode()).hexdigest()[:8].upper()}"
-            cur.execute(
-                "INSERT OR REPLACE INTO relationships VALUES (?, ?, ?, ?, 'REFERENCES', ?, 'document', ?, ?, 'pattern_ner', 0.92, ?, 0, NULL)",
-                (
-                    rel_id,
-                    source_id,
-                    doc_ent_id,
-                    eid,
-                    doc_id,
-                    f"{doc_id}:{title}",
-                    text[:160].strip(),
-                    ts,
-                ),
-            )
-            extracted_edges.append(
-                {
-                    "id": rel_id,
-                    "source": doc_ent_id,
-                    "source_name": f"{title} ({doc_id})",
-                    "rel_type": "REFERENCES",
-                    "target": eid,
-                    "target_name": ename,
-                    "is_inferred": False,
-                }
-            )
+        extracted_edges.append({
+            "id": rel_id, "source": doc_ent_id, "source_name": doc_node_name,
+            "rel_type": "REFERENCES", "target": eid, "target_name": ename, "is_inferred": False,
+        })
 
+    entity_names = [(r["name"], r["entity_type"]) for r in cur.execute("SELECT name, entity_type FROM entities ORDER BY length(name) DESC")]
+    index_document(conn, doc_id, source_id, title, text, entity_names)
+    conflicts = get_document_conflict_groups(conn, document_ids=[doc_id])
     conn.commit()
+    graph_size = _document_graph_size(cur)
     conn.close()
 
     return {
         "document_id": doc_id,
+        "operation": operation,
         "source_id": source_id,
         "title": title,
         "entities_extracted": extracted_entities,
         "relationships_extracted": extracted_edges,
         "total_mentioned_entities": len(mentioned_entities),
+        "ignored_instruction_count": ignored_instruction_count,
+        "conflicts": conflicts,
+        "ingestion_time_ms": round((time.perf_counter() - started) * 1000, 2),
+        "graph_size": graph_size,
+    }
+
+
+def _remove_document_graph_contributions(cur: sqlite3.Cursor, document_id: str) -> None:
+    prefix = document_id + ":"
+    cur.execute(
+        """DELETE FROM relationships
+           WHERE source_type = 'document'
+             AND (source_record = ? OR substr(source_record, 1, ?) = ? OR source_id = ?)""",
+        (document_id, len(prefix), prefix, document_id),
+    )
+    cur.execute(
+        """DELETE FROM relationships
+           WHERE source_entity_id = ? OR target_entity_id = ?""",
+        (f"ENT-{document_id}", f"ENT-{document_id}"),
+    )
+    cur.execute("DELETE FROM entities WHERE id = ? OR source_id = ?", (f"ENT-{document_id}", document_id))
+    owned = cur.execute(
+        """SELECT id FROM entities WHERE source_type = 'document'
+           AND (source_id = ? OR source_record = ? OR substr(source_record, 1, ?) = ?)""",
+        (document_id, document_id, len(prefix), prefix),
+    ).fetchall()
+    for row in owned:
+        entity_id = row["id"]
+        referenced = cur.execute(
+            "SELECT 1 FROM relationships WHERE source_entity_id = ? OR target_entity_id = ? LIMIT 1",
+            (entity_id, entity_id),
+        ).fetchone()
+        if not referenced:
+            cur.execute("DELETE FROM entities WHERE id = ?", (entity_id,))
+    for table in ("document_terms", "document_claims", "document_metadata"):
+        cur.execute(f"DELETE FROM {table} WHERE document_id = ?", (document_id,))
+
+
+def _document_graph_size(cur: sqlite3.Cursor) -> Dict[str, int]:
+    return {
+        "documents": cur.execute("SELECT COUNT(*) FROM documents").fetchone()[0],
+        "entities": cur.execute("SELECT COUNT(*) FROM entities WHERE is_merged = 0").fetchone()[0],
+        "relationships": cur.execute("SELECT COUNT(*) FROM relationships").fetchone()[0],
+    }
+
+
+def list_graph_documents(source_id: Optional[str] = None) -> Dict[str, Any]:
+    conn = _get_graph_conn()
+    query = """SELECT d.id, d.source_id, d.title, d.doc_type, length(d.content) AS char_count, d.created_at,
+                      COALESCE(m.ignored_instruction_count, 0) AS ignored_instruction_count
+               FROM documents d LEFT JOIN document_metadata m ON m.document_id = d.id"""
+    params: Tuple[Any, ...] = ()
+    if source_id:
+        query += " WHERE d.source_id = ?"
+        params = (source_id,)
+    query += " ORDER BY d.created_at DESC, d.id"
+    docs = [dict(row) for row in conn.execute(query, params).fetchall()]
+    graph_size = _document_graph_size(conn.cursor())
+    conn.close()
+    return {"documents": docs, "document_count": len(docs), "graph_size": graph_size}
+
+
+def get_graph_document(document_id: str) -> Optional[Dict[str, Any]]:
+    conn = _get_graph_conn()
+    row = conn.execute(
+        """SELECT d.id, d.source_id, d.title, d.doc_type, d.content, d.created_at,
+                  COALESCE(m.ignored_instruction_count, 0) AS ignored_instruction_count
+           FROM documents d LEFT JOIN document_metadata m ON m.document_id = d.id WHERE d.id = ?""",
+        (document_id,),
+    ).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def get_document_graph_stats() -> Dict[str, Any]:
+    conn = _get_graph_conn()
+    cur = conn.cursor()
+    stats = _document_graph_size(cur)
+    ignored = cur.execute("SELECT COALESCE(SUM(ignored_instruction_count), 0) FROM document_metadata").fetchone()[0]
+    last_updated = cur.execute("SELECT MAX(created_at) FROM documents").fetchone()[0]
+    conn.close()
+    return {"graph_size": stats, "ignored_instruction_count": ignored, "last_updated": last_updated}
+
+
+def delete_document_from_graph(document_id: str) -> Dict[str, Any]:
+    conn = _get_graph_conn()
+    cur = conn.cursor()
+    row = cur.execute("SELECT id, title FROM documents WHERE id = ?", (document_id,)).fetchone()
+    if not row:
+        conn.close()
+        raise ValueError(f"Document '{document_id}' was not found.")
+    _remove_document_graph_contributions(cur, document_id)
+    cur.execute("DELETE FROM documents WHERE id = ?", (document_id,))
+    conn.commit()
+    graph_size = _document_graph_size(cur)
+    conn.close()
+    return {"document_id": document_id, "title": row["title"], "deleted": True, "graph_size": graph_size}
+
+
+def ingest_documents_batch(documents: List[Dict[str, str]]) -> Dict[str, Any]:
+    started = time.perf_counter()
+    results: List[Dict[str, Any]] = []
+    errors: List[Dict[str, Any]] = []
+    for index, item in enumerate(documents):
+        try:
+            result = ingest_document_to_graph(
+                source_id=item["source_id"], title=item["title"], doc_type=item.get("doc_type", "audit_memo"),
+                text=item["text"], document_id=item.get("document_id"),
+            )
+            results.append(result)
+        except Exception as exc:
+            errors.append({"index": index, "title": item.get("title", ""), "error": str(exc)})
+    graph_size = get_document_graph_stats()["graph_size"]
+    return {
+        "documents_requested": len(documents),
+        "documents_processed": len(results),
+        "documents_created": sum(item["operation"] == "created" for item in results),
+        "documents_updated": sum(item["operation"] == "updated" for item in results),
+        "failed_count": len(errors),
+        "ignored_instruction_count": sum(item["ignored_instruction_count"] for item in results),
+        "ingestion_time_ms": round((time.perf_counter() - started) * 1000, 2),
+        "graph_size": graph_size,
+        "results": [
+            {"document_id": item["document_id"], "operation": item["operation"],
+             "ignored_instruction_count": item["ignored_instruction_count"],
+             "ingestion_time_ms": item["ingestion_time_ms"]}
+            for item in results
+        ],
+        "errors": errors,
     }
 
 

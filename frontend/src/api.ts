@@ -107,6 +107,17 @@ export interface RoutingDecision {
   retrieval_steps: string[];
 }
 
+export interface GraphDocument {
+  id: string;
+  source_id: string;
+  title: string;
+  doc_type: string;
+  char_count?: number;
+  content?: string;
+  created_at: string;
+  ignored_instruction_count: number;
+}
+
 export interface SQLExecuteResponse {
   source_id: string;
   original_question?: string;
@@ -189,6 +200,7 @@ export const api = {
     include_inferred?: boolean;
     include_merged_aliases?: boolean;
     search?: string;
+    max_edges?: number;
   }) => {
     const q = new URLSearchParams();
     if (params.source_id) q.set('source_id', params.source_id);
@@ -196,6 +208,7 @@ export const api = {
     if (params.include_inferred !== undefined) q.set('include_inferred', String(params.include_inferred));
     if (params.include_merged_aliases !== undefined) q.set('include_merged_aliases', String(params.include_merged_aliases));
     if (params.search) q.set('search', params.search);
+    if (params.max_edges !== undefined) q.set('max_edges', String(params.max_edges));
     return request<any>(`/api/graph?${q.toString()}`);
   },
   getEntityDetail: (entityId: string) => request<any>(`/api/graph/entity/${encodeURIComponent(entityId)}`),
@@ -211,6 +224,25 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ source_id, title, doc_type, text }),
     }),
+  ingestDocuments: (documents: Array<{ source_id: string; title: string; doc_type: string; text: string }>) =>
+    request<any>('/api/graph/ingest/batch', {
+      method: 'POST',
+      body: JSON.stringify({ documents }),
+    }),
+  getDocuments: (sourceId?: string) =>
+    request<{ documents: GraphDocument[]; document_count: number; graph_size: Record<string, number> }>(
+      `/api/graph/documents${sourceId ? `?source_id=${encodeURIComponent(sourceId)}` : ''}`
+    ),
+  getDocument: (documentId: string) =>
+    request<GraphDocument>(`/api/graph/documents/${encodeURIComponent(documentId)}`),
+  updateDocument: (documentId: string, payload: { source_id: string; title: string; doc_type: string; text: string }) =>
+    request<any>(`/api/graph/documents/${encodeURIComponent(documentId)}`, {
+      method: 'PUT',
+      body: JSON.stringify(payload),
+    }),
+  deleteDocument: (documentId: string) =>
+    request<any>(`/api/graph/documents/${encodeURIComponent(documentId)}`, { method: 'DELETE' }),
+  getDocumentStats: () => request<any>('/api/graph/documents/stats'),
   getCommunities: (sourceId?: string) =>
     request<{ total_communities: number; communities: any[] }>(
       `/api/graph/communities${sourceId ? `?source_id=${encodeURIComponent(sourceId)}` : ''}`

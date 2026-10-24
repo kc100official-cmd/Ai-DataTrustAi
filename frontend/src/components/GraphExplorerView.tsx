@@ -180,6 +180,7 @@ interface Edge3DProps {
   isHighlighted: boolean;
   isSelected: boolean;
   isConnectedToSelectedNode: boolean;
+  hasActiveSelection: boolean;
   onSelectEdge: (edge: any) => void;
 }
 
@@ -190,6 +191,7 @@ const GraphEdge3D: React.FC<Edge3DProps> = ({
   isHighlighted,
   isSelected,
   isConnectedToSelectedNode,
+  hasActiveSelection,
   onSelectEdge,
 }) => {
   const particleRef = useRef<THREE.Mesh>(null);
@@ -217,6 +219,7 @@ const GraphEdge3D: React.FC<Edge3DProps> = ({
   });
 
   const active = isHighlighted || isSelected || isConnectedToSelectedNode;
+  const isDimmed = hasActiveSelection && !active;
   const lineColor = isHighlighted
     ? '#10B981'
     : isSelected
@@ -232,24 +235,26 @@ const GraphEdge3D: React.FC<Edge3DProps> = ({
       <Line
         points={[start, end]}
         color={lineColor}
-        lineWidth={active ? 2.4 : 1.1}
+        lineWidth={active ? 2.5 : isDimmed ? 0.7 : 1.1}
         dashed={Boolean(edge.is_inferred)}
         dashSize={0.4}
         gapSize={0.25}
         transparent
-        opacity={active ? 0.92 : 0.36}
+        opacity={active ? 0.95 : isDimmed ? 0.08 : 0.3}
         onClick={(e) => {
           e.stopPropagation();
           onSelectEdge(edge);
         }}
       />
 
-      <mesh ref={particleRef}>
-        <sphereGeometry args={[active ? 0.12 : 0.075, 10, 10]} />
-        <meshBasicMaterial
-          color={isHighlighted ? '#34D399' : edge.is_inferred ? '#C4B5FD' : '#67E8F9'}
-        />
-      </mesh>
+      {!isDimmed && (
+        <mesh ref={particleRef}>
+          <sphereGeometry args={[active ? 0.12 : 0.065, 10, 10]} />
+          <meshBasicMaterial
+            color={isHighlighted ? '#34D399' : edge.is_inferred ? '#C4B5FD' : '#67E8F9'}
+          />
+        </mesh>
+      )}
 
       {active && (
         <Html distanceFactor={16} position={midPoint} center zIndexRange={[1, 0]}>
@@ -278,6 +283,7 @@ export const GraphExplorerView: React.FC<GraphExplorerViewProps> = ({
   const [searchQuery, setSearchQuery] = useState<string>('');
   const [relTypeFilter, setRelTypeFilter] = useState<string>('ALL');
   const [includeInferred, setIncludeInferred] = useState<boolean>(true);
+  const [linkDensity, setLinkDensity] = useState<'clean' | 'balanced' | 'all'>('clean');
 
   const [graphData, setGraphData] = useState<any>({ nodes: [], edges: [], relationship_types: [] });
   const [loading, setLoading] = useState<boolean>(false);
@@ -312,12 +318,14 @@ export const GraphExplorerView: React.FC<GraphExplorerViewProps> = ({
   const loadGraph = async () => {
     setLoading(true);
     try {
+      const maxEdgesParam = linkDensity === 'clean' ? 25 : linkDensity === 'balanced' ? 50 : 0;
       const data = await api.getGraph({
         source_id: sourceFilter === 'ALL' ? undefined : sourceFilter,
         rel_type: relTypeFilter === 'ALL' ? undefined : relTypeFilter,
         include_inferred: includeInferred,
         include_merged_aliases: false,
         search: searchQuery || undefined,
+        max_edges: maxEdgesParam,
       });
       setGraphData(data);
       if (data.nodes.length >= 2 && !pathSourceId && !pathTargetId) {
@@ -343,7 +351,7 @@ export const GraphExplorerView: React.FC<GraphExplorerViewProps> = ({
   useEffect(() => {
     loadGraph();
     loadResolutions();
-  }, [sourceFilter, relTypeFilter, includeInferred]);
+  }, [sourceFilter, relTypeFilter, includeInferred, linkDensity]);
 
   useEffect(() => {
     if (initialSelectedEntityId) {
@@ -505,6 +513,17 @@ export const GraphExplorerView: React.FC<GraphExplorerViewProps> = ({
                 </option>
               )
             )}
+          </select>
+
+          <select
+            value={linkDensity}
+            onChange={(e) => setLinkDensity(e.target.value as any)}
+            className="px-3.5 py-2 rounded-xl bg-[#030d2b] border border-cyan-400/40 text-xs text-cyan-200 font-mono shadow-[0_0_10px_rgba(34,211,238,0.15)] outline-none"
+            title="Adjust number of links to keep a clean graph look"
+          >
+            <option value="clean">✦ Clean Look (25 Links)</option>
+            <option value="balanced">Balanced (50 Links)</option>
+            <option value="all">Full Graph (All Links)</option>
           </select>
 
           <button
@@ -803,6 +822,7 @@ export const GraphExplorerView: React.FC<GraphExplorerViewProps> = ({
                         isHighlighted={isHighlighted}
                         isSelected={isSelectedEdge}
                         isConnectedToSelectedNode={isConnectedToSelectedNode}
+                        hasActiveSelection={Boolean(selectedNodeId || selectedEdge)}
                         onSelectEdge={(edgeObj) => setSelectedEdge(edgeObj)}
                       />
                     );

@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Any, List, Optional
 from .config import settings
+from .document_store import ensure_document_store
 
 
 SOURCES_METADATA: Dict[str, Dict[str, Any]] = {
@@ -56,18 +57,43 @@ def ensure_sample_databases(force_reset: bool = False) -> None:
             get_graph_db_path(),
         ]:
             if p.exists():
-                p.unlink()
-    _init_enterprise_db(get_db_path("enterprise_supply_ops"))
-    _init_california_schools_db(get_db_path("california_schools_bird_demo"))
+                try:
+                    p.unlink()
+                except OSError:
+                    try:
+                        conn = sqlite3.connect(str(p))
+                        cur = conn.cursor()
+                        tbls = [
+                            row[0]
+                            for row in cur.execute(
+                                "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+                            ).fetchall()
+                        ]
+                        for tbl in tbls:
+                            cur.execute(f"DROP TABLE IF EXISTS [{tbl}]")
+                        conn.commit()
+                        conn.close()
+                    except Exception:
+                        pass
+    _init_enterprise_db(get_db_path("enterprise_supply_ops"), force_reset=force_reset)
+    _init_california_schools_db(get_db_path("california_schools_bird_demo"), force_reset=force_reset)
     _init_meta_db(get_meta_db_path())
-    _init_graph_db(get_graph_db_path())
+    _init_graph_db(get_graph_db_path(), force_reset=force_reset)
+    graph_conn = sqlite3.connect(str(get_graph_db_path()))
+    ensure_document_store(graph_conn)
+    graph_conn.commit()
+    graph_conn.close()
 
 
-def _init_enterprise_db(db_path: Path) -> None:
-    if db_path.exists():
+def _init_enterprise_db(db_path: Path, force_reset: bool = False) -> None:
+    if db_path.exists() and not force_reset:
         return
     conn = sqlite3.connect(str(db_path))
     cur = conn.cursor()
+    if force_reset:
+        for tbl in ["incidents", "shipments", "procurement_contracts", "vendors", "facilities", "regions"]:
+            cur.execute(f"DROP TABLE IF EXISTS [{tbl}]")
+        conn.commit()
     cur.executescript(
         """
         PRAGMA foreign_keys = ON;
@@ -213,11 +239,15 @@ def _init_enterprise_db(db_path: Path) -> None:
     conn.close()
 
 
-def _init_california_schools_db(db_path: Path) -> None:
-    if db_path.exists():
+def _init_california_schools_db(db_path: Path, force_reset: bool = False) -> None:
+    if db_path.exists() and not force_reset:
         return
     conn = sqlite3.connect(str(db_path))
     cur = conn.cursor()
+    if force_reset:
+        for tbl in ["satscores", "frpm", "schools"]:
+            cur.execute(f"DROP TABLE IF EXISTS [{tbl}]")
+        conn.commit()
     cur.executescript(
         """
         PRAGMA foreign_keys = ON;
@@ -331,11 +361,23 @@ def _init_meta_db(db_path: Path) -> None:
     conn.close()
 
 
-def _init_graph_db(db_path: Path) -> None:
-    if db_path.exists():
+def _init_graph_db(db_path: Path, force_reset: bool = False) -> None:
+    if db_path.exists() and not force_reset:
         return
     conn = sqlite3.connect(str(db_path))
     cur = conn.cursor()
+    if force_reset:
+        for tbl in [
+            "documents",
+            "entities",
+            "relationships",
+            "entity_resolutions",
+            "document_metadata",
+            "document_terms",
+            "document_claims",
+        ]:
+            cur.execute(f"DROP TABLE IF EXISTS [{tbl}]")
+        conn.commit()
     cur.executescript(
         """
         CREATE TABLE documents (

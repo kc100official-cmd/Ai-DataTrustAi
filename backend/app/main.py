@@ -13,8 +13,13 @@ from .graph_engine import (
     find_bounded_paths,
     get_entity_details,
     get_entity_neighbors,
+    get_document_graph_stats,
+    get_graph_document,
     get_full_graph,
+    ingest_documents_batch,
     ingest_document_to_graph,
+    list_graph_documents,
+    delete_document_from_graph,
 )
 from .models import (
     AddCompanyRequest,
@@ -22,6 +27,7 @@ from .models import (
     AskRequest,
     AskResponse,
     EntityResolveRequest,
+    GraphBatchIngestRequest,
     EvaluationRunRequest,
     GraphIngestRequest,
     GraphPathRequest,
@@ -86,7 +92,7 @@ def health_check():
         "llm_model": settings.LLM_MODEL,
         "llm_param_billions": settings.LLM_PARAM_BILLIONS,
         "fallback_mode": "active_deterministic_compiler" if not settings.LLM_ENABLED else "llm_with_deterministic_fallback",
-        "embeddings_mode": "dense_embeddings" if settings.EMBEDDINGS_ENABLED else "tfidf_lexical_fallback",
+        "embeddings_mode": "dense_embeddings" if settings.EMBEDDINGS_ENABLED else "incremental_multilingual_lexical_index",
     }
 
 
@@ -151,6 +157,7 @@ def get_graph_overview(
     include_inferred: bool = Query(True),
     include_merged_aliases: bool = Query(False),
     search: Optional[str] = Query(None),
+    max_edges: Optional[int] = Query(None),
 ):
     return get_full_graph(
         source_id=source_id,
@@ -158,6 +165,7 @@ def get_graph_overview(
         include_inferred=include_inferred,
         include_merged_aliases=include_merged_aliases,
         search_query=search,
+        max_edges=max_edges,
     )
 
 
@@ -171,9 +179,60 @@ def ingest_graph_document(req: GraphIngestRequest):
             title=req.title,
             doc_type=req.doc_type,
             text=req.text,
+            document_id=req.document_id,
         )
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"Ingestion error: {str(exc)}")
+
+
+@app.post("/api/graph/ingest/batch")
+def ingest_graph_documents_batch(req: GraphBatchIngestRequest):
+    if any(not document.text.strip() for document in req.documents):
+        raise HTTPException(status_code=422, detail="Document text cannot be empty.")
+    try:
+        return ingest_documents_batch([document.model_dump() for document in req.documents])
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Batch ingestion error: {str(exc)}")
+
+
+@app.get("/api/graph/documents/stats")
+def graph_document_stats_endpoint():
+    return get_document_graph_stats()
+
+
+@app.get("/api/graph/documents")
+def graph_documents_endpoint(source_id: Optional[str] = Query(None)):
+    return list_graph_documents(source_id=source_id)
+
+
+@app.get("/api/graph/documents/{document_id}")
+def graph_document_endpoint(document_id: str):
+    document = get_graph_document(document_id)
+    if not document:
+        raise HTTPException(status_code=404, detail=f"Document '{document_id}' was not found.")
+    return document
+
+
+@app.put("/api/graph/documents/{document_id}")
+def update_graph_document_endpoint(document_id: str, req: GraphIngestRequest):
+    if not req.text.strip():
+        raise HTTPException(status_code=422, detail="Document text cannot be empty.")
+    try:
+        return ingest_document_to_graph(
+            source_id=req.source_id, title=req.title, doc_type=req.doc_type, text=req.text, document_id=document_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Document update error: {str(exc)}")
+
+
+@app.delete("/api/graph/documents/{document_id}")
+def delete_graph_document_endpoint(document_id: str):
+    try:
+        return delete_document_from_graph(document_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
 
 
 @app.get("/api/graph/entity/{entity_id}")

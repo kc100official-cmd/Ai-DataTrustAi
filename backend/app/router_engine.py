@@ -1,6 +1,7 @@
 import re
 from typing import Any, Dict, List, Optional, Tuple
 from .database import discover_schema
+from .document_safety import normalize_multilingual_query
 from .graph_engine import get_full_graph
 from .models import RoutingDecision, RoutingStrategy
 from .retrieval_engine import search_documents_and_excerpts
@@ -27,7 +28,8 @@ def inspect_and_route_question(
     than an uncalibrated LLM probability.
     """
     q_clean = (question or "").strip()
-    q_low = q_clean.lower()
+    q_input_low = q_clean.casefold()
+    q_low = f"{q_input_low} {normalize_multilingual_query(q_clean)}".lower()
 
     schema = discover_schema(source_id)
     graph = get_full_graph(source_id=source_id, include_inferred=True)
@@ -53,7 +55,7 @@ def inspect_and_route_question(
     sql_intent_terms = {
         "total", "sum", "average", "avg", "count", "how many", "highest", "lowest",
         "top", "budget", "value", "spend", "delay", "score", "rate", "enrollment",
-        "math", "sat", "charter", "table", "rows", "amount", "impact", "cost",
+        "math", "sat", "charter", "table", "rows", "amount", "impact", "cost", "status", "compliance",
     }
     graph_intent_terms = {
         "path", "connect", "connected", "relationship", "related", "link", "chain",
@@ -61,7 +63,7 @@ def inspect_and_route_question(
         "trace", "between", "network", "partner", "partners",
     }
     doc_intent_terms = {
-        "memo", "directive", "audit", "policy", "report", "document", "suspended",
+        "memo", "directive", "audit", "policy", "report", "document", "suspended", "status", "suspension",
         "suspension", "curriculum", "quantum", "why was", "explain the audit",
     }
 
@@ -76,7 +78,7 @@ def inspect_and_route_question(
     # 1. Check for critical entity ambiguity ("Mercury" or "Mahindra" without disambiguating Product vs Organization)
     if (
         ("mercury" in q_low and "logistics" not in q_low and "project" not in q_low and "transceiver" not in q_low and "freight" not in q_low)
-        or (q_low.strip() in ("tell me about mahindra", "what is the status of mahindra?", "show mahindra"))
+        or (q_input_low.strip() in ("tell me about mahindra", "what is the status of mahindra?", "show mahindra"))
     ):
         return RoutingDecision(
             question=q_clean,
@@ -147,17 +149,17 @@ def inspect_and_route_question(
             sources_consulted=[
                 f"{source_id} schema catalog ({len(schema.tables)} tables)",
                 f"Knowledge Graph ({graph['total_nodes']} entities)",
-                "Document store (TF-IDF lexical index)",
+                "Document store (incremental multilingual lexical index)",
             ],
             alternative_strategy="semantic_retrieval",
-            alternative_rationale="Checked semantic/lexical index (0 documents above minimum relevance threshold).",
+            alternative_rationale="Checked the incremental multilingual document index (0 documents above minimum relevance threshold).",
             evidence_coverage_score=0.0,
             clarification_needed=False,
             classifier_mode="deterministic_rules",
             retrieval_steps=[
                 "1. Checked SQL schema catalog for matching entities/columns (0 matches)",
                 "2. Searched Knowledge Graph nodes and aliases (0 matches)",
-                "3. Evaluated document TF-IDF similarity (below threshold)",
+                "3. Evaluated incremental multilingual document relevance (below threshold)",
                 "4. Enforced verified abstention policy",
             ],
         )
@@ -186,6 +188,7 @@ def inspect_and_route_question(
         or ("status" in q_low and ("audit" in q_low or "directive" in q_low or "suspend" in q_low or "verify" in q_low))
         or (has_sql_signal and has_graph_signal)
         or (has_sql_signal and has_doc_signal)
+        or any(hit.get("conflicts") for hit in sem_hits["results"])
     )
 
     if is_conflict_or_audit_question:
@@ -260,8 +263,8 @@ def inspect_and_route_question(
             clarification_needed=False,
             classifier_mode="deterministic_rules",
             retrieval_steps=[
-                "1. Vectorized query via TF-IDF lexical/bi-gram similarity index",
-                "2. Ranked document and provenance excerpts by cosine similarity",
+                "1. Expanded English/Hindi query terms against the incremental document index",
+                "2. Ranked document and provenance excerpts using inverse-document-frequency weights",
                 "3. Extracted supporting passages and document IDs",
             ],
         )

@@ -62,7 +62,7 @@ const NEXUS_RANDOM_ACTS = [
   {
     type: 'ARC_DISCHARGE',
     badge: 'Neural Arc Pulse',
-    detail: 'Gwalior Hub ↔ Larsen & Toubro ($1.45M verified)',
+    detail: 'Gwalior Hub ↔ Larsen & Toubro ($6.4M verified)',
     color: '#FDE68A',
     pair: [1, 5] as [number, number],
   },
