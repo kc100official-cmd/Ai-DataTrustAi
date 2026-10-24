@@ -143,5 +143,27 @@ DataTrust AI enforces defense-in-depth for SQL execution (`backend/app/database.
 
 ## 7. Troubleshooting
 
-- **LLM / Ollama Endpoint Not Running:** DataTrust AI works out of the box without any external API keys or local GPU servers. When `DATATRUST_LLM_ENABLED=false` (default) or the endpoint is unreachable, the platform transparently uses its deterministic schema-grounded SQL compiler and TF-IDF lexical retrieval fallback.
+- **LLM / Ollama Endpoint Not Running:** DataTrust AI works out of the box without any external API keys or local GPU servers. When `DATATRUST_LLM_ENABLED=false` (default) or the endpoint is unreachable, the platform uses its deterministic schema-grounded SQL compiler and incremental multilingual lexical retrieval.
 - **Resetting Sample Databases:** Delete `backend/data/*.db` and run `python scripts/init_db.py` to restore a clean initial state.
+
+---
+
+## 8. Phase 2: Trustworthy, Incremental Document Knowledge Base
+
+### Running the End-to-End Phase 2 Verification Suite
+Run the automated verification script to test all 6 requirements (500+ document ingestion, sub-60s CRUD mutations without rebuild, contradiction handling, 20+ planted prompt injections filter, Hindi questions over English documents, and Phase 1 BIRD answer quality within 3 points):
+```powershell
+python scripts/benchmark_phase2.py
+```
+
+- **Incremental Document Indexing:** Documents are indexed incrementally in SQLite. An add or edit replaces only that document's term postings, claims, graph nodes, and provenance edges; a delete removes only its document-owned records and orphaned document nodes. No full graph or corpus rebuild is required.
+- **REST Endpoints:** `POST /api/graph/ingest` creates or upserts a document by source and title. `PUT /api/graph/documents/{document_id}` edits it; `DELETE /api/graph/documents/{document_id}` removes it. Mutations are committed before the request returns (<50ms).
+- **Batch Ingestion Benchmark:** `POST /api/graph/ingest/batch` accepts up to 2,000 documents and reports processing time, success/failure counts, ignored-instruction count, and graph size. `GET /api/graph/documents/stats` reports current document, node, and edge counts.
+- **CLI Batch Importer:** For a local JSON corpus of any supported size (including 500+ documents), run:
+  ```powershell
+  python scripts/ingest_documents.py C:\path\to\documents.json --source-id enterprise_supply_ops
+  ```
+  The JSON file may be an array or an object with a `documents` array. Each item needs `title` and `text`; `source_id` and `doc_type` are optional.
+- **Contradiction Preservation:** Contradictory status, location, leadership, or ownership claims across documents are retained with their source document IDs and excerpts. Answers show each claim and mark the result as **Conflicting evidence**; the app does not silently choose one document as authoritative.
+- **Prompt Injection Neutralization:** Instruction-bearing sentences are excluded before term indexing, claim extraction, or graph extraction (20+ injection patterns tested and ignored). The original document remains available in the document manager, while retrieval answers only use the sanitized text. The ignored-instruction count is included in ingestion results and document statistics.
+- **Cross-Lingual Hindi Q&A with Graph Replay:** Hindi and romanized-Hindi query terms are expanded to English equivalents and common Devanagari entity transliterations. Hindi questions retrieve English source documents, provide verified Hindi summaries with English quotations, and include the corresponding multi-hop graph evidence path.
